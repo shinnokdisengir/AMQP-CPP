@@ -732,17 +732,19 @@ bool ChannelImpl::send(const Frame &frame)
     
     // are we currently in synchronous mode or are there
     // other frames waiting for their turn to be sent?
-    if (_synchronous || !_queue.empty())
     {
-        // we need to wait until the synchronous frame has
-        // been processed, so queue the frame until it was
-        _queue.emplace(frame.synchronous(), frame);
+        std::lock_guard<std::mutex> locker(_queue_mutex);
+        if (_synchronous || !_queue.empty())
+        {
+            // we need to wait until the synchronous frame has
+            // been processed, so queue the frame until it was
+            _queue.emplace(frame.synchronous(), frame);
 
-        // it was of course not actually sent but we pretend
-        // that it was, because no error occured
-        return true;
+            // it was of course not actually sent but we pretend
+            // that it was, because no error occured
+            return true;
+        }
     }
-
     // send to tcp connection
     if (!_connection->send(frame)) return false;
     
@@ -766,10 +768,12 @@ void ChannelImpl::flush()
     Monitor monitor(this);
 
     // send all frames while not in synchronous mode
+    std::unique_lock<std::mutex> locker(_queue_mutex);
     while (_connection && !_synchronous && !_queue.empty())
     {
         // retrieve the first buffer and synchronous
         auto &pair = _queue.front();
+        locker.unlock();
 
         // mark as synchronous if necessary
         _synchronous = pair.first;
@@ -781,6 +785,7 @@ void ChannelImpl::flush()
         if (!monitor.valid()) return;
 
         // remove from the list
+        locker.lock();
         _queue.pop();
     }
 }
@@ -798,8 +803,10 @@ void ChannelImpl::reportError(const char *message, bool notifyhandler)
     
     // the queue of messages that still have to sent can be emptied now
     // (we do this by moving the current queue into an unused variable)
-    auto queue(std::move(_queue));
-
+    {
+        std::lock_guard<std::mutex> locker(_queue_mutex);
+        auto queue(std::move(_queue));
+    }
     // we are going to call callbacks that could destruct the channel
     Monitor monitor(this);
 
